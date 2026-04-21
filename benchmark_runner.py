@@ -32,8 +32,13 @@ import sys
 import time
 from pathlib import Path
 
-from dotenv import load_dotenv
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
+if load_dotenv is not None:
+    load_dotenv()
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -43,16 +48,68 @@ try:
 except ImportError:
     AnthropicRateLimitError = None
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 
 class Answer(BaseModel):
     question_id: str
     answer: bool
 
+    @field_validator("question_id", mode="before")
+    @classmethod
+    def normalize_question_id(cls, value):
+        if isinstance(value, str):
+            return value.strip("()")
+        return value
+
 
 class BenchmarkResponse(BaseModel):
     answers: list[Answer]
+
+
+def normalized_question_id(value):
+    if isinstance(value, str):
+        return value.strip("()")
+    return value
+
+
+def iter_answers(response):
+    """Yield answer entries from either a BenchmarkResponse or a raw response dict."""
+    if response is None:
+        return
+
+    if isinstance(response, BenchmarkResponse):
+        for answer in response.answers:
+            yield answer
+        return
+
+    if isinstance(response, dict):
+        for answer in response.get("answers", []):
+            if isinstance(answer, dict):
+                yield answer
+
+
+def answer_question_id(answer):
+    if isinstance(answer, Answer):
+        return normalized_question_id(answer.question_id)
+    if isinstance(answer, dict):
+        return normalized_question_id(answer.get("question_id"))
+    return None
+
+
+def answer_value(answer):
+    if isinstance(answer, Answer):
+        return answer.answer
+    if isinstance(answer, dict):
+        return answer.get("answer")
+    return None
+
+
+def find_answer_by_label(response, label):
+    for answer in iter_answers(response):
+        if answer_question_id(answer) == label:
+            return answer
+    return None
 
 
 from backdoor_oracle import generate_backdoor_questions
@@ -66,7 +123,7 @@ from prompt_templates import (
     build_full_prompt,
 )
 
-DEFAULT_MODEL = "claude-sonnet-4-20250514"
+DEFAULT_MODEL = "claude-sonnet-4-6"
 OUTPUT_DIR = Path(__file__).parent
 
 
@@ -122,14 +179,15 @@ def score_identification(response, ground_truth_identified):
     """Score the identification question (a)."""
     if response is None:
         return {"question": "identification", "correct": None, "error": "no response"}
-    q_a = next((a for a in response.answers if a.question_id == "a"), None)
+    q_a = find_answer_by_label(response, "a")
     if not q_a:
         return {"question": "identification", "correct": None, "error": "question (a) not found"}
+    q_a_value = answer_value(q_a)
     return {
         "question": "identification",
-        "model_answer": q_a.answer,
+        "model_answer": q_a_value,
         "ground_truth": ground_truth_identified,
-        "correct": q_a.answer == ground_truth_identified,
+        "correct": q_a_value == ground_truth_identified,
         "source": "ananke",
     }
 
@@ -141,7 +199,7 @@ def score_backdoor(response, backdoor_ground_truth, label_offset=0):
     results = []
     for i, gt in enumerate(backdoor_ground_truth):
         label = chr(ord("a") + i + label_offset)
-        q = next((a for a in response.answers if a.question_id == label), None)
+        q = find_answer_by_label(response, label)
         if not q:
             results.append({
                 "question": f"backdoor_{label}",
@@ -150,12 +208,13 @@ def score_backdoor(response, backdoor_ground_truth, label_offset=0):
                 "error": f"question ({label}) not found",
             })
             continue
+        q_value = answer_value(q)
         results.append({
             "question": f"backdoor_{label}",
             "candidate_set": gt["candidate_set"],
-            "model_answer": q.answer,
+            "model_answer": q_value,
             "ground_truth": gt["satisfies_backdoor"],
-            "correct": q.answer == gt["satisfies_backdoor"],
+            "correct": q_value == gt["satisfies_backdoor"],
             "source": gt.get("source", "dowhy"),
         })
     return results
@@ -168,7 +227,7 @@ def score_frontdoor(response, frontdoor_ground_truth, label_offset=0):
     results = []
     for i, gt in enumerate(frontdoor_ground_truth):
         label = chr(ord("a") + i + label_offset)
-        q = next((a for a in response.answers if a.question_id == label), None)
+        q = find_answer_by_label(response, label)
         if not q:
             results.append({
                 "question": f"frontdoor_{label}",
@@ -177,12 +236,13 @@ def score_frontdoor(response, frontdoor_ground_truth, label_offset=0):
                 "error": f"question ({label}) not found",
             })
             continue
+        q_value = answer_value(q)
         results.append({
             "question": f"frontdoor_{label}",
             "candidate_set": gt["candidate_set"],
-            "model_answer": q.answer,
+            "model_answer": q_value,
             "ground_truth": gt["satisfies_frontdoor"],
-            "correct": q.answer == gt["satisfies_frontdoor"],
+            "correct": q_value == gt["satisfies_frontdoor"],
             "source": gt.get("source", "dowhy"),
         })
     return results
